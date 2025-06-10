@@ -1,0 +1,6 @@
+transformers
+torch
+onnx
+onnxruntime
+matplotlib
+aiohttp
