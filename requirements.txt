@@ -3,4 +3,4 @@ torch
 onnx
 onnxruntime
 matplotlib
-aiohttp
+pynvml
