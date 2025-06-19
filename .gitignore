@@ -1,0 +1,4 @@
+# Ignore folders generated for models
+baseline/
+dynamic/
+onnx/

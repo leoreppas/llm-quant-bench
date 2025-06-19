@@ -1,9 +1,13 @@
+import os
 import torch
 import time
 import threading
 import pynvml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Optional, Dict, Any
+import torch.quantization as torch_quant
+import onnxruntime.quantization as onnx_quant
+import onnxruntime
 
 class GPUMonitor:
     def __init__(self, monitoring_interval: float = 0.1):
@@ -105,7 +109,6 @@ def benchmark_single_prompt(
         )
     if device.startswith("cuda"): torch.cuda.synchronize()
     end_time = time.perf_counter()
-
     total_time = end_time - start_time
 
     # Measure TTFT (time to first token)
@@ -128,32 +131,122 @@ def benchmark_single_prompt(
     }
 
 
-if __name__ == "__main__":
-    # Run baseline benchmark
+def run_benchmark(model_name: str, prompt: str, quant: Optional[str] = None) -> Dict[str, Any]:
+    # create per-variant folder
+    variant_name = quant or "baseline"
+    os.makedirs(variant_name, exist_ok=True)
+
+    # Load base model and tokenizer
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Save baseline model weights for size measurement
+    baseline_path = os.path.join(variant_name, "baseline.pth")
+    torch.save(model.state_dict(), baseline_path)
+    size_mb = os.path.getsize(baseline_path) / 1024**2
+
+    # Apply PyTorch dynamic quant if var is set
+    device_override: Optional[str] = None
+    if quant == "dynamic":
+        model = torch_quant.quantize_dynamic(
+            model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+        # Save dynamic model weights for size measurement
+        dyn_path = os.path.join(variant_name, "dynamic.pth")
+        torch.save(model.state_dict(), dyn_path)
+        size_mb = os.path.getsize(dyn_path) / 1024**2
+        device_override = "cpu"
+
+    # Export and quantize ONNX if var is set
+    onnx_path: Optional[str] = None
+    if quant == "onnx":
+        # Export to ONNX
+        enc = tokenizer(prompt, return_tensors="pt")
+        onnx_file = os.path.join(variant_name, "model.onnx")
+        torch.onnx.export(
+            model.cpu(), enc["input_ids"],
+            onnx_file,
+            input_names=["input_ids"],
+            output_names=["logits"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
+                          "logits":   {0: "batch", 1: "seq"}},
+            opset_version=14
+        )
+        # Quantize the ONNX model
+        quantized_path = os.path.join(variant_name, "model-quant.onnx")
+        onnx_quant.quantize_dynamic(
+            onnx_file, quantized_path,
+            weight_type=onnx_quant.QuantType.QInt8
+        )
+        onnx_path = quantized_path
+        # Measure ONNX-quant file size
+        size_mb = os.path.getsize(quantized_path) / 1024**2
+
+    # Start GPU monitoring
     gpu_monitor = GPUMonitor()
     gpu_monitor.start()
 
-    model = AutoModelForCausalLM.from_pretrained("gpt2-xl")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2-xl")
-    prompt = "Once upon a time, there was a magical forest"
+    # Run inference and timing
+    if quant != "onnx":
+        metrics = benchmark_single_prompt(
+            model=model,
+            tokenizer=tokenizer,
+            input_prompt_text=prompt,
+            temperature=0.7,
+            top_p=0.95,
+            max_new_tokens=100,
+            device=device_override
+        )
+    else:
+        # ONNXRuntime path
+        providers = (["CUDAExecutionProvider"]
+                     if "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                     else ["CPUExecutionProvider"])
+        sess = onnxruntime.InferenceSession(onnx_path, providers=providers)
+        inputs = tokenizer(prompt, return_tensors="np")
+        onnx_inputs = {"input_ids": inputs["input_ids"]}
 
-    base = benchmark_single_prompt(
-        model=model,
-        tokenizer=tokenizer,
-        input_prompt_text=prompt,
-        temperature=0.7,
-        top_p=0.95,
-        max_new_tokens=100
-    )
+        # Warm-up run
+        _ = sess.run(None, onnx_inputs)
+        # Measure ONNX inference time
+        if "CUDAExecutionProvider" in providers and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        _ = sess.run(None, onnx_inputs)
+        if "CUDAExecutionProvider" in providers and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end = time.perf_counter()
+        metrics = {
+            "ttft_seconds":       None,
+            "total_time_seconds": end - start,
+            "tokens_per_second":  1.0 / (end - start),
+            "generated_text":     None
+        }
 
+    # Stop GPU monitoring and attach resource stats
     gpu_monitor.stop()
-    base["peak_usage"] = gpu_monitor.get_peak_usage()
-    base["peak_utilisation"] = gpu_monitor.get_peak_utilisation()
-    base["p90_usage"] = gpu_monitor.get_p90_usage()
-    base["p90_utilisation"] = gpu_monitor.get_p90_utilisation()
+    metrics.update({
+        "peak_usage_mb": gpu_monitor.get_peak_usage(),
+        "peak_util_pct": gpu_monitor.get_peak_utilisation(),
+        "p90_usage_mb":  gpu_monitor.get_p90_usage(),
+        "p90_util_pct":  gpu_monitor.get_p90_utilisation()
+    })
 
-    print(f"Generated: {base['generated_text']}")
-    print(f"TTFT: {base['ttft_seconds']:.4f}s | Total: {base['total_time_seconds']:.4f}s | TPS: {base['tokens_per_second']:.2f}")
-    print(f"Peak Mem: {base['peak_usage']:.2f} MB | 90th% Mem: {base['p90_usage']:.2f} MB")
-    print(f"Peak GPU%: {base['peak_utilisation']:.2f}% | 90th% GPU%: {base['p90_utilisation']:.2f}%")
+    # Record model file size
+    metrics["model_size_mb"] = size_mb
 
+    # Print & return
+    print(f"Variant: {variant_name}")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+    return metrics
+
+
+results = {}
+for variant in [None, "dynamic", "onnx"]:
+    print(f"-------------{variant or 'baseline'}-------------")
+    results[variant or "baseline"] = run_benchmark(
+        model_name="gpt2-xl",
+        prompt="Once upon a time, there was a magical forest",
+        quant=variant
+    )
