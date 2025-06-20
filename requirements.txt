@@ -4,3 +4,4 @@ onnx
 onnxruntime
 matplotlib
 pynvml
+psutil
